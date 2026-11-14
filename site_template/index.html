@@ -1,0 +1,84 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width,initial-scale=1" />
+<title>BookBridge · Static Catalog Test</title>
+<style>
+:root{font-family:system-ui,-apple-system,Segoe UI,Roboto,sans-serif;color-scheme:light dark}body{max-width:880px;margin:48px auto;padding:0 20px;line-height:1.55}h1{font-size:1.65rem}p{color:#777}form{display:grid;grid-template-columns:1fr 1fr auto;gap:10px;align-items:end}label{display:block;font-weight:600}input{display:block;box-sizing:border-box;width:100%;padding:11px;border:1px solid #999;border-radius:6px;background:transparent;color:inherit}button{padding:12px 18px;background:#28764c;color:white;border:0;border-radius:6px;cursor:pointer}ul{list-style:none;padding:0}li{border-bottom:1px solid #aaa5;padding:12px 0}.muted{font-size:.9rem;color:#777}.notice{padding:11px;background:#eee;color:#333;border-radius:6px}#status{margin:18px 0;white-space:pre-wrap}@media(max-width:650px){form{grid-template-columns:1fr}}
+</style>
+</head>
+<body>
+<h1>BookBridge — GitHub-hosted catalog test</h1>
+<p class="notice">Proof of concept. Bibliographic metadata only. Search results do not establish that a book is available to download or that downloading is permitted. This site is not affiliated with any catalog source.</p>
+<p id="about">Loading catalog manifest…</p>
+<form id="searchForm">
+<label>Book title<input id="title" value="The Time Machine" maxlength="200" placeholder="The Time Machine" /></label>
+<label>Author (optional)<input id="author" maxlength="160" placeholder="H. G. Wells" /></label>
+<button type="submit">Search</button>
+</form>
+<div id="status" aria-live="polite"></div>
+<ul id="results"></ul>
+<script>
+'use strict';
+const norm = s => (s || '').normalize('NFKD').toLowerCase().replace(/[\u0300-\u036f]/g, '').replace(/[^\p{L}\p{N}_]+/gu, ' ').trim();
+const tnorm = s => norm(s).replace(/^(the|an|a)\s+/, '');
+const surname = s => s.includes(',') ? norm(s.split(',')[0]) : (norm(s).split(' ').pop() || '');
+const keyOf = s => { const v=norm(s), stem=(v.slice(0,3).replace(/ /g,'_') + '___').slice(0,3); return /^[a-z0-9_]{3}$/.test(stem)?stem:('u'+((v.codePointAt(0)||0)&255).toString(16).padStart(2,'0')); };
+const matchTitle = (q, c) => {const a=tnorm(q), b=tnorm(c);return !!a && (a===b || (b.startsWith(a+' ') && b.length-a.length<=60));};
+const matchAuthor = (q, c) => {if (!q) return true;const a=norm(q),b=norm(c);return !!a && !!b && surname(q)===surname(c) && (a===surname(q) || a.split(' ')[0][0] === b.split(' ')[0][0]);};
+let manifest;
+const status = document.getElementById('status'), list = document.getElementById('results');
+const formatSize = n => (n/1024).toFixed(1) + ' KiB';
+async function start() {
+  const r = await fetch('./manifest.json', {cache:'no-store'});
+  if (!r.ok) throw Error('Cannot fetch manifest (HTTP '+r.status+')');
+  manifest = await r.json();
+  if (manifest.schema !== 'bookbridge-static-1') throw Error('Unsupported manifest schema');
+  document.getElementById('about').textContent = `${manifest.record_count.toLocaleString()} ${manifest.source==='synthetic-demo'?'synthetic demo':'catalog'} records · ${manifest.stats.shards} search shards · ${(manifest.stats.compressed_bytes/1048576).toFixed(2)} MiB stored (title + author indexes)`;
+  status.textContent = 'Ready. Search by title or leave title blank for an author-only search.';
+}
+async function search(e) {
+  e.preventDefault();list.replaceChildren();
+  const title=document.getElementById('title').value.trim(),author=document.getElementById('author').value.trim();
+  if (!title && !author){status.textContent='Enter a title or author.';return;}
+  const kind=title?'title':'author', key=keyOf(title?tnorm(title):surname(author));
+  const item=manifest.shards?.[kind]?.[key];
+  if (!item){status.textContent='No matches; this prefix has no indexed records.';return;}
+  if (typeof DecompressionStream==='undefined'){status.textContent='This browser does not support DecompressionStream(gzip).';return;}
+  const time=performance.now();status.textContent='Fetching one compressed shard…';
+  try {
+    const url=`./data/${kind}/${key[0]}/${key}.jsonl.gz`;
+    const r=await fetch(url);
+    if (!r.ok) throw Error('Shard fetch HTTP '+r.status);
+    const compressed=await r.arrayBuffer();
+    if (compressed.byteLength !== item.bytes) throw Error('Shard length mismatch');
+    if (crypto?.subtle) {
+      const digest = await crypto.subtle.digest('SHA-256', compressed);
+      const digestHex = Array.from(new Uint8Array(digest), v=>v.toString(16).padStart(2,'0')).join('');
+      if (digestHex !== item.sha256) throw Error('Shard checksum mismatch');
+    }
+    const stream=new Blob([compressed]).stream().pipeThrough(new DecompressionStream('gzip'));
+    const raw=await new Response(stream).text();
+    const hits=[];
+    for (const line of raw.split('\n')){
+      if (!line) continue;
+      const rec=JSON.parse(line);
+      if (title && !matchTitle(title,rec[0])) continue;
+      if (author && !matchAuthor(author,rec[1])) continue;
+      hits.push(rec);if(hits.length>=30)break;
+    }
+    status.textContent=`${hits.length} result(s) · 1 shard · ${formatSize(compressed.byteLength)} transferred · ${Math.round(performance.now()-time)} ms`;
+    for(const [title,author,ext,year,source,id] of hits){
+      const li=document.createElement('li');
+      const strong=document.createElement('strong');strong.textContent=title;
+      const description=document.createElement('div');description.className='muted';description.textContent=`${author} · ${ext.toUpperCase()} · ${year || 'Year unknown'} · ${source} · catalog only`;
+      li.append(strong,description);list.append(li);
+    }
+  } catch(err){status.textContent='Search error: '+err.message;}
+}
+document.getElementById('searchForm').addEventListener('submit', search);
+start().catch(err=>{status.textContent=err.message;});
+</script>
+</body>
+</html>

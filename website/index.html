@@ -1,0 +1,73 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>BookBridge — Versioned Catalog Test</title>
+  <style>
+    :root {font-family:system-ui,-apple-system,Segoe UI,sans-serif;color-scheme:light dark}
+    body {max-width:900px;margin:44px auto;padding:0 20px;line-height:1.5}
+    .note {background:#ddd;color:#222;border-radius:8px;padding:14px}
+    form {display:flex;gap:12px;flex-wrap:wrap;align-items:end;margin:20px 0}
+    label {display:grid;gap:5px;flex:1;min-width:180px}
+    input {padding:12px;border:1px solid #888;border-radius:6px;font:inherit}
+    button {background:#226443;color:white;border:0;padding:13px 20px;border-radius:6px;cursor:pointer}
+    ul {list-style:none;padding:0} li {padding:10px 0;border-bottom:1px solid #9994}
+    small {display:block;color:#888} pre {white-space:pre-wrap;overflow-wrap:anywhere}
+  </style>
+</head>
+<body>
+  <h1>BookBridge — Versioned GitHub Catalog</h1>
+  <p class="note"><b>Technical demo only.</b> Synthetic catalog data. No real BookBridge catalog records, no downloads, and no claims of download availability.</p>
+  <p id="summary">Loading active release…</p>
+  <form id="form"><label>Title <input id="title" value="BookBridge Synthetic Release Marker"></label>
+    <label>Author <input id="author" placeholder="Optional"></label><button type="submit">Search</button></form>
+  <p id="status" role="status"></p><ul id="results"></ul>
+<script>
+'use strict';
+const $=x=>document.getElementById(x);
+const norm=s=>(s||'').normalize('NFKD').toLowerCase().replace(/[\u0300-\u036f]/g,'').replace(/[^\p{L}\p{N}_]+/gu,' ').trim();
+const tnorm=s=>norm(s).replace(/^(the|a|an)\s+/, '');
+const surname=s=>String(s||'').includes(',')?norm(s.split(',')[0]):(norm(s).split(' ').pop()||'');
+const keyOf=s=>{const v=norm(s),k=(v.slice(0,3).replace(/ /g,'_')+'___').slice(0,3);return /^[a-z0-9_]{3}$/.test(k)?k:('u'+((v.codePointAt(0)||0)&255).toString(16).padStart(2,'0'));};
+const sha=async data=>Array.from(new Uint8Array(await crypto.subtle.digest('SHA-256',data)),b=>b.toString(16).padStart(2,'0')).join('');
+async function fetchBytes(path, max){const r=await fetch('./'+path,{cache:'no-store'});if(!r.ok)throw Error(path+' HTTP '+r.status);const bytes=await r.arrayBuffer();if(bytes.byteLength>max)throw Error('Response too large');return bytes;}
+let manifest, pointer;
+async function start(){
+  const pointerBytes=await fetchBytes('current.json',4096);
+  pointer=JSON.parse(new TextDecoder().decode(pointerBytes));
+  if(pointer.schema!=='bookbridge-catalog-pointer-1'||pointer.synthetic_only!==true||!/^v[0-9]{4,8}$/.test(pointer.version)||pointer.manifest!==`versions/${pointer.version}/manifest.json`)throw Error('Pointer invalid');
+  const content=await fetchBytes(pointer.manifest,4*1024*1024);
+  if(await sha(content)!==pointer.manifest_sha256)throw Error('Manifest SHA mismatch');
+  manifest=JSON.parse(new TextDecoder().decode(content));
+  if(manifest.schema!=='bookbridge-versioned-static-1'||manifest.source!=='synthetic-demo'||manifest.version!==pointer.version)throw Error('Manifest invalid');
+  $('summary').textContent=`Active release ${pointer.version} · ${manifest.record_count.toLocaleString()} synthetic records · ${manifest.stats.shards.toLocaleString()} indexed shards`;
+  $('status').textContent='Ready. Try a title or an author-only search.';
+}
+function matchTitle(q,t){let a=tnorm(q),b=tnorm(t);return !q||a===b||(b.startsWith(a+' ')&&b.length-a.length<=60);}
+function matchAuthor(q,a){if(!q)return true;let x=norm(q),y=norm(a);return surname(q)===surname(a)&&(x===surname(q)||x.split(' ')[0]?.[0]===y.split(' ')[0]?.[0]);}
+$('form').addEventListener('submit',async e=>{
+ e.preventDefault();$('results').replaceChildren();
+ const title=$('title').value.trim(),author=$('author').value.trim();
+ if(!title&&!author){$('status').textContent='Enter a title or author';return;}
+ const kind=title?'title':'author',key=keyOf(title?tnorm(title):surname(author));
+ const item=manifest?.shards?.[kind]?.[key];
+ if(!item){$('status').textContent='No indexed matches for this prefix.';return;}
+ try{
+   if(!/^objects\/[0-9a-f]{2}\/[0-9a-f]{64}\.jsonl\.gz$/.test(item.path)||item.bytes>16*1024*1024)throw Error('Invalid shard reference');
+   const before=performance.now(), data=await fetchBytes(item.path,item.bytes);
+   if(data.byteLength!==item.bytes||await sha(data)!==item.sha256)throw Error('Shard integrity failed');
+   const text=await new Response(new Blob([data]).stream().pipeThrough(new DecompressionStream('gzip'))).text();
+   let count=0;
+   for(const line of text.split('\n')){
+     if(!line)continue;const row=JSON.parse(line);
+     if(!Array.isArray(row)||row.length!==6||!matchTitle(title,row[0])||!matchAuthor(author,row[1]))continue;
+     const li=document.createElement('li'),name=document.createElement('strong'),desc=document.createElement('small');
+     name.textContent=row[0];desc.textContent=`${row[1]} · ${row[2]} · ${row[3]} · catalog only`;
+     li.append(name,desc);$('results').append(li);count++;if(count>=30)break;
+   }
+   $('status').textContent=`${count} result(s) · ${data.byteLength.toLocaleString()} bytes · ${Math.round(performance.now()-before)} ms · ${pointer.version}`;
+ }catch(err){$('status').textContent='Search failed: '+err.message;}
+});
+start().catch(err=>$('status').textContent='Catalog failed validation: '+err.message);
+</script>
+</body></html>

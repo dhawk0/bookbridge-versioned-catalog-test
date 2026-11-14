@@ -1,0 +1,9 @@
+__pycache__/
+*.pyc
+.venv/
+_state/
+_candidate/
+_site/
+*.sqlite*
+*.rar
+*.zip

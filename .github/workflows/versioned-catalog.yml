@@ -1,0 +1,97 @@
+name: BookBridge versioned synthetic catalog
+
+on:
+  workflow_dispatch:
+    inputs:
+      operation:
+        description: 'Publish a synthetic version, or roll back the pointer'
+        required: true
+        type: choice
+        options: [publish, rollback]
+      version:
+        description: 'Synthetic test version'
+        required: true
+        type: choice
+        options: [v0001, v0002]
+
+permissions:
+  contents: write
+  pages: write
+  id-token: write
+
+concurrency:
+  group: bookbridge-versioned-pages
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - name: Checkout publisher source
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Restore durable catalog-state branch
+        shell: bash
+        run: |
+          set -euo pipefail
+          STATE="$RUNNER_TEMP/bookbridge-catalog-state"
+          if git ls-remote --exit-code origin refs/heads/catalog-state >/dev/null; then
+            git fetch origin refs/heads/catalog-state:refs/remotes/origin/catalog-state
+            git worktree add --detach "$STATE" refs/remotes/origin/catalog-state
+          else
+            git worktree add --detach "$STATE" HEAD
+            git -C "$STATE" checkout --orphan catalog-state
+            git -C "$STATE" rm -rfq -- .
+            git -C "$STATE" clean -fdx
+          fi
+          echo "CATALOG_STATE=$STATE" >> "$GITHUB_ENV"
+
+      - name: Build and validate synthetic catalog version
+        shell: bash
+        env:
+          OPERATION: ${{ inputs.operation }}
+          VERSION: ${{ inputs.version }}
+        run: |
+          set -euo pipefail
+          if [ "$OPERATION" = publish ]; then
+            python3 publisher/make_synthetic_candidate.py \
+              --version "$VERSION" --count 15000 --output "$RUNNER_TEMP/bookbridge-candidate"
+            python3 publisher/versioned_catalog.py publish \
+              --site "$CATALOG_STATE" --candidate "$RUNNER_TEMP/bookbridge-candidate" --version "$VERSION"
+          else
+            python3 publisher/versioned_catalog.py rollback \
+              --site "$CATALOG_STATE" --version "$VERSION"
+          fi
+          python3 publisher/versioned_catalog.py verify --site "$CATALOG_STATE" --all-versions
+
+      - name: Save validated catalog branch
+        shell: bash
+        run: |
+          set -euo pipefail
+          git -C "$CATALOG_STATE" config user.name 'github-actions[bot]'
+          git -C "$CATALOG_STATE" config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git -C "$CATALOG_STATE" add -A
+          if ! git -C "$CATALOG_STATE" diff --cached --quiet; then
+            git -C "$CATALOG_STATE" commit -m "Catalog ${{ inputs.operation }} ${{ inputs.version }}"
+            git -C "$CATALOG_STATE" push origin HEAD:refs/heads/catalog-state
+          else
+            echo 'No catalog branch changes to commit'
+          fi
+
+      - name: Configure GitHub Pages
+        uses: actions/configure-pages@v5
+
+      - name: Upload verified Pages site
+        uses: actions/upload-pages-artifact@v4
+        with:
+          path: ${{ env.CATALOG_STATE }}
+
+      - name: Deploy verified Pages site
+        id: deployment
+        uses: actions/deploy-pages@v4
