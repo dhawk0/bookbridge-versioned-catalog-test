@@ -1,0 +1,66 @@
+name: BookBridge hosted synthetic sync
+on:
+  workflow_dispatch:
+    inputs:
+      mode:
+        type: choice
+        options: [check, publish]
+        default: check
+  schedule:
+    - cron: '23 8 * * 1'
+permissions:
+  contents: write
+  pages: write
+  id-token: write
+concurrency:
+  group: bookbridge-versioned-pages
+  cancel-in-progress: false
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    environment:
+      name: github-pages
+      url: ${{ steps.deploy.outputs.page_url }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Run regression tests
+        run: python3 -B -m unittest discover -s tests -q
+      - name: Restore catalog-state
+        run: |
+          set -euo pipefail
+          git fetch origin refs/heads/catalog-state:refs/remotes/origin/catalog-state
+          git worktree add --detach "$RUNNER_TEMP/catalog-state" refs/remotes/origin/catalog-state
+          echo "CATALOG_STATE=$RUNNER_TEMP/catalog-state" >> "$GITHUB_ENV"
+      - name: Check synthetic changes
+        id: sync
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          REQUEST_MODE: ${{ inputs.mode }}
+        run: |
+          set -euo pipefail
+          ARGS=()
+          if [ "$EVENT_NAME" = "workflow_dispatch" ] && [ "$REQUEST_MODE" = "publish" ]; then ARGS+=(--apply); fi
+          python3 -B publisher/hosted_catalog_sync.py --feed publisher/synthetic_feed.json --site "$CATALOG_STATE" "${ARGS[@]}" | tee "$RUNNER_TEMP/sync.json"
+          echo "state=$(python3 -c 'import json,sys;print(json.load(open(sys.argv[1]))["state"])' "$RUNNER_TEMP/sync.json")" >> "$GITHUB_OUTPUT"
+          python3 publisher/versioned_catalog.py verify --site "$CATALOG_STATE" --all-versions
+      - name: Commit validated synthetic release
+        if: steps.sync.outputs.state == 'UPDATED'
+        run: |
+          set -euo pipefail
+          git -C "$CATALOG_STATE" config user.name 'github-actions[bot]'
+          git -C "$CATALOG_STATE" config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git -C "$CATALOG_STATE" add -A
+          git -C "$CATALOG_STATE" commit -m "Update synthetic hosted catalog"
+          git -C "$CATALOG_STATE" push origin HEAD:refs/heads/catalog-state
+      - uses: actions/configure-pages@v5
+        if: steps.sync.outputs.state == 'UPDATED'
+      - uses: actions/upload-pages-artifact@v4
+        if: steps.sync.outputs.state == 'UPDATED'
+        with:
+          path: ${{ env.CATALOG_STATE }}
+      - uses: actions/deploy-pages@v4
+        id: deploy
+        if: steps.sync.outputs.state == 'UPDATED'
