@@ -90,7 +90,7 @@ def check_group(manifest, group, key):
 def main():
     pointer, manifest = load()
     title_year = check_group(manifest, "title", "boo")
-    author_year = check_group(manifest, "author", "exa")
+    author_year = check_group(manifest, "author", "rob")
     if title_year != author_year:
         raise ValueError("TITLE_AUTHOR_INDEX_DISAGREE")
     print(json.dumps({
